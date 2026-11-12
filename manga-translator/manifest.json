@@ -1,0 +1,51 @@
+{
+  "manifest_version": 3,
+  "name": "MTL — Manga Translator Local",
+  "version": "1.7.5",
+  "minimum_chrome_version": "109",
+  "description": "Перевод манги и комиксов прямо в браузере: детекция пузырей (RT-DETR), OCR (PP-OCRv5 / PP-OCRv6 Manga / Manga-OCR), стирание текста (inpainting), перевод через Google или локальную LLM (OpenAI-compatible: Unsloth, LM Studio, Ollama), режим Vision OCR — LLM с поддержкой изображений читает и переводит сама.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "js/background/service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "js/content/textlayout.js",
+        "js/content/content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "html/popup.html",
+    "default_title": "MTL — переводчик манги",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  }
+}

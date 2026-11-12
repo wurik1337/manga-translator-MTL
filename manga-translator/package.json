@@ -1,0 +1,7 @@
+{
+  "name": "manga-translator-local",
+  "version": "1.0.0",
+  "description": "Локальный переводчик манги: RT-DETR + PP-OCR/Manga-OCR + Google/локальная LLM",
+  "type": "module",
+  "private": true
+}
