@@ -34,6 +34,12 @@
 - Два движка перевода: Google Translate (бесплатно, без ключей) или своя локальная LLM (подключение только по OpenAI-compatible API).
 - Два режима вывода: перекраска пузыря целиком или компактная плашка поверх оригинала.
 - Перевод всей страницы, включая длинные вертикальные ленты (webtoon).
+- «Загрузить всё и перевести» — для ленивой загрузки: страница автоматически прокручивается, картинки догружаются, позиция возвращается на место.
+- Горячие клавиши для «Перевести», «Загрузить всё»: клик по чипу справа от кнопки → назначь сочетание.
+- Авто-перевод картинок при появлении на экране.
+- Склейка страниц: реплика, разрезанная краем страницы, докрашивается по шву; OCR читает объединённый текст, перевод рисуется на следующей странице (режимы «Стирать текст» / «Рамки», включено по умолчанию).
+- «Остановить»: во время «Перевести всю страницу» и «Загрузить всё и перевести» кнопка становится «■ Остановить»; процесс прерывается, при сборе картинок позиция сразу возвращается.
+- Экономия памяти на длинных главах: оверлеи рисуются только в окне ±1.6 экрана, чистые пиксели страниц хранятся сжатыми — 100+ переведённых картинок не подвешивают страницу.
 - Авто-перевод картинок при появлении на экране.
 - Отладка: показать рамки детекции, при наведении на плашку подсмотреть оригинал.
 - Тёмный интерфейс, 8 языков (ru / en / es / de / fr / pt / zh / ja).
@@ -106,6 +112,12 @@ Home → API Mode → вставь адрес → «Проверить соед�
 - Two translation engines: Google Translate (free, no keys) or your own local LLM (connection via OpenAI-compatible API only).
 - Two output modes: repaint the whole bubble or a compact overlay box.
 - Full-page translation, including long vertical webtoon strips.
+- "Load all & translate" for lazy-loaded pages: auto-scrolls, loads images, then restores scroll position.
+- Hotkeys for Translate, Load all: click the chip next to a button and press your shortcut.
+- Auto-translate images as they appear on screen.
+- Page stitching: a speech bubble cut by a page edge is completed along the seam; OCR re-reads the merged text, and the full translation is drawn on the next page (works in Erase text / Boxes modes, enabled by default).
+- Stop: during Translate whole page / Load all & translate, the button becomes "■ Stop"; the process stops, and scroll position is restored during image collection.
+- Memory savings on long chapters: overlays render only within ±1.6 screens, clean page pixels are stored compressed — 100+ translated images won't freeze the page.
 - Auto-translation of images as they appear on screen.
 - Debugging: show detection boxes, hover an overlay to peek at the original text.
 - Dark UI, 8 languages (ru / en / es / de / fr / pt / zh / ja).

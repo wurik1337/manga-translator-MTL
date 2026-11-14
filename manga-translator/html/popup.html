@@ -117,21 +117,25 @@
       </div>
     </div>
 
-    <div class="two-col">
-      <div class="card toggle-card">
-        <div>
-          <div class="card-title sm" data-i18n="autoT">Авто-перевод</div>
-          <div class="card-sub" data-i18n="autoTSub">при появлении на экране</div>
-        </div>
-        <label class="switch"><input type="checkbox" id="auto-translate"><span></span></label>
+    <!-- v1.8.1: карточка на всю ширину, как «Локальные файлы» — после удаления
+         «Вне пузырей» в двухколоночной сетке оставалась пустота -->
+    <div class="card toggle-card">
+      <div>
+        <div class="card-title sm" data-i18n="autoT">Авто-перевод</div>
+        <div class="card-sub" data-i18n="autoTSub">при появлении на экране</div>
       </div>
-      <div class="card toggle-card">
-        <div>
-          <div class="card-title sm" data-i18n="freeText">Вне пузырей</div>
-          <div class="card-sub" data-i18n="freeTextSub">SFX и подписи</div>
-        </div>
-        <label class="switch"><input type="checkbox" id="free-text"><span></span></label>
+      <label class="switch"><input type="checkbox" id="auto-translate"><span></span></label>
+    </div>
+
+    <!-- v1.9.0: склейка страниц — реплики, разрезанные краем страницы:
+         полоска шва между соседними страницами докрашивает OCR,
+         полный перевод рисуется на поздней странице -->
+    <div class="card toggle-card">
+      <div>
+        <div class="card-title sm" data-i18n="stitchT">Склейка страниц</div>
+        <div class="card-sub" data-i18n="stitchTSub">текст, разрезанный между страницами</div>
       </div>
+      <label class="switch"><input type="checkbox" id="page-stitch"><span></span></label>
     </div>
 
     <div class="card toggle-card" id="file-access-card">
@@ -142,15 +146,32 @@
       <button id="file-access-btn" class="mini-btn">Открыть настройки</button>
     </div>
 
-    <button id="translate-page" class="big-btn"><span data-i18n="translatePage">▶ Перевести всю страницу</span></button>
-    <button id="debug-page" class="big-btn ghost">
-      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="5" width="14" height="14" rx="2"/><path d="M2 9h2M2 15h2M20 9h2M20 15h2M9 2v2M15 2v2M9 20v2M15 20v2"/></svg>
-      <span data-i18n="showFrames">Показать рамки детекции</span>
-    </button>
-    <button id="clear-page" class="big-btn ghost">
-      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-14M10 11v6M14 11v6"/></svg>
-      <span data-i18n="clearPage">Стереть перевод со страницы</span>
-    </button>
+    <div class="section-label row-labels">
+      <span data-i18n="secActions">Функции</span>
+      <span class="hk-cap" data-i18n="hkLabel">горячие клавиши</span>
+    </div>
+    <div class="action-row">
+      <button id="translate-page" class="big-btn"><span data-i18n="translatePage">▶ Перевести всю страницу</span></button>
+      <button id="hk-translatePage" class="bind-key" data-action="translatePage" data-i18n-title="hkTitle">—</button>
+    </div>
+    <div class="action-row">
+      <button id="load-all-page" class="big-btn load-all"><span data-i18n="loadAllPage">⤓ Загрузить всё и перевести</span></button>
+      <button id="hk-loadAll" class="bind-key" data-action="loadAll" data-i18n-title="hkTitle">—</button>
+    </div>
+    <div class="action-row">
+      <button id="debug-page" class="big-btn ghost">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="5" width="14" height="14" rx="2"/><path d="M2 9h2M2 15h2M20 9h2M20 15h2M9 2v2M15 2v2M9 20v2M15 20v2"/></svg>
+        <span data-i18n="showFrames">Показать рамки детекции</span>
+      </button>
+      <button id="hk-debugPage" class="bind-key" data-action="debugPage" data-i18n-title="hkTitle">—</button>
+    </div>
+    <div class="action-row">
+      <button id="clear-page" class="big-btn ghost">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-14M10 11v6M14 11v6"/></svg>
+        <span data-i18n="clearPage">Стереть перевод со страницы</span>
+      </button>
+      <button id="hk-clearPage" class="bind-key" data-action="clearPage" data-i18n-title="hkTitle">—</button>
+    </div>
     <div id="page-progress" class="card progress-card hidden">
       <div class="bar"><div class="fill" id="page-fill"></div></div>
       <div class="progress-text" id="page-text"></div>

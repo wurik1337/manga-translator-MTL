@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "MTL — Manga Translator Local",
-  "version": "1.7.6",
+  "version": "1.10.1",
   "minimum_chrome_version": "109",
-  "description": "Перевод манги и комиксов прямо в браузере: детекция пузырей (RT-DETR), OCR (PP-OCRv5 / PP-OCRv6 Manga / Manga-OCR), стирание текста (inpainting), перевод через Google или локальную LLM (OpenAI-compatible: Unsloth, LM Studio, Ollama), режим Vision OCR — LLM с поддержкой изображений читает и переводит сама.",
+  "description": "Перевод манги и комиксов прямо в браузере: детекция пузырей (RT-DETR), OCR (PP-OCRv5 / PP-OCRv6 Manga / Manga-OCR), стирание текста (inpainting), перевод через Google или локальную LLM (OpenAI-compatible: Unsloth, LM Studio, Ollama), режим Vision OCR — LLM с поддержкой изображений читает и переводит сама, склейка страниц для реплик, разрезанных краем страницы.",
   "permissions": [
     "storage",
     "activeTab",
@@ -23,6 +23,7 @@
       ],
       "js": [
         "js/content/textlayout.js",
+        "js/content/stitchlib.js",
         "js/content/content.js"
       ],
       "run_at": "document_idle",

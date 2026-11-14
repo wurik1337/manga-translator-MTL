@@ -5,7 +5,7 @@
 // перезапуска появляется за ~1-2 с, а не после минут ожидания. Все привязки
 // null-safe. Карточка «Локальные файлы (file://)» проверяет доступ первой.
 
-import { MSG, DEFAULT_SETTINGS, LANGUAGES, mergeSettings } from '../lib/protocol.js';
+import { MSG, DEFAULT_SETTINGS, LANGUAGES, mergeSettings, formatCombo } from '../lib/protocol.js';
 import { MODEL_CATALOG } from '../lib/modelmeta.js';
 import { parseCustomOcrZip, decodeDict, isCustomOcrId, customOcrId } from '../lib/customocr.js';
 import { putCustomOcrFiles } from '../lib/modelstore.js';
@@ -111,7 +111,16 @@ async function loadStateWithRetry() {
     ]);
     if (setRes?.ok && stRes?.ok) break;
   }
-  if (setRes?.ok) settings = setRes.settings;
+  // пустой/битый ответ фона не должен затирать настройки — это выглядело как
+  // «сбрасываются горячие клавиши» при переоткрытии popup
+  if (setRes?.ok && setRes.settings) settings = setRes.settings;
+  if (!setRes?.ok) {
+    // фон не отвечает: настройки лежат в storage и читаются без SW
+    try {
+      const { settings: saved } = await chrome.storage.local.get('settings');
+      if (saved) settings = mergeSettings(saved);
+    } catch (e) { /* storage недоступен — остаёмся на дефолтах */ }
+  }
   if (stRes?.ok && stRes.state?.catalog) {
     state = stRes.state;
     swDead = false;
@@ -229,10 +238,14 @@ function bindStatic() {
 
   // тумблеры home
   on('auto-translate', 'change', (e) => patchSettings({ autoTranslate: e.target.checked }));
-  on('free-text', 'change', (e) => patchSettings({ translateFreeText: e.target.checked }));
+  // «Склейка страниц» (v1.9.0): реплики, разрезанные краем страницы
+  on('page-stitch', 'change', (e) => patchSettings({ pageStitch: e.target.checked }));
+  // «Вне пузырей» удалено из UI в v1.8.1 — перевод вне пузырей всегда включён
 
   // перевести страницу
   on('translate-page', 'click', async () => {
+    // «Остановить» (v1.10.0): во время задачи кнопка-инициатор в режиме стопа
+    if ($('translate-page')?.dataset.stop === '1') { await send({ type: MSG.PAGE_JOB_STOP }); return; }
     if (uiLock) return;
     if (swDead) {
       const w = $('page-progress');
@@ -256,6 +269,7 @@ function bindStatic() {
 
   // показать рамки детекции (отладка: без перевода, только где модель нашла текст)
   on('debug-page', 'click', async () => {
+    if ($('debug-page')?.dataset.stop === '1') { await send({ type: MSG.PAGE_JOB_STOP }); return; }
     if (uiLock) return;
     if (swDead) {
       const w = $('page-progress');
@@ -310,6 +324,41 @@ function bindStatic() {
       }
     }
   });
+
+  // «Загрузить всё и перевести» (v1.8.0): сначала виртуальный скролл страницы
+  // заставляет сайт подгрузить дальние картинки, затем обычный перевод всего.
+  on('load-all-page', 'click', async () => {
+    if ($('load-all-page')?.dataset.stop === '1') { await send({ type: MSG.PAGE_JOB_STOP }); return; }
+    if (uiLock) return;
+    if (swDead) {
+      const w = $('page-progress');
+      if (w) w.classList.remove('hidden');
+      setPageProgress({
+        active: false,
+        error: 'Нет связи с фоновым процессом. Нажми «Перезапустить расширение» в красной карточке выше.',
+      });
+      return;
+    }
+    uiLock = true;
+    const btn = $('load-all-page');
+    if (btn) btn.disabled = true;
+    const w = $('page-progress');
+    if (w) w.classList.remove('hidden');
+    setPageProgress({ active: true, done: 0, total: 0 });
+    await send({ type: MSG.TRANSLATE_PAGE, preload: true });
+    // загрузка картинок + перевод — даём больше времени, чем обычному переводу
+    setTimeout(() => { uiLock = false; const b = $('load-all-page'); if (b) b.disabled = false; }, 150000);
+  });
+
+  // чипы горячих клавиш: клик → режим записи сочетания (v1.8.0)
+  for (const [id] of HK_BTNS) {
+    on(id, 'click', () => {
+      if (hkListening) { hkListening = null; hkRender(); }
+      hkListening = { action: (HK_BTNS.find(([bid]) => bid === id) || [])[1] };
+      hkRender();
+    });
+  }
+  window.addEventListener('keydown', hkCapture, true);
 
   // confidence
   on('min-confidence', 'input', (e) => {
@@ -423,6 +472,67 @@ function updateFileAccessUi(allowed) {
   }
 }
 
+// ---------------- горячие клавиши (v1.8.0) ----------------
+
+const HK_BTNS = [
+  ['hk-translatePage', 'translatePage'],
+  ['hk-loadAll', 'loadAll'],
+  ['hk-debugPage', 'debugPage'],
+  ['hk-clearPage', 'clearPage'],
+];
+let hkListening = null; // { action } — чип ждёт сочетание от пользователя
+
+/** Подписи чипов биндов: «—» / назначенное сочетание / «клавиши…» в режиме записи. */
+function hkRender() {
+  for (const [id, action] of HK_BTNS) {
+    const b = $(id);
+    if (!b) continue;
+    const listening = hkListening?.action === action;
+    const bind = settings?.hotkeys?.[action] || '';
+    b.textContent = listening ? t('hkListening') : (bind || t('hkEmpty'));
+    b.classList.toggle('listening', listening);
+    b.classList.toggle('set', !listening && !!bind);
+  }
+}
+
+function hkSave(action, combo) {
+  const next = { ...(settings?.hotkeys || {}) };
+  for (const k of Object.keys(next)) if (next[k] === combo) delete next[k]; // одно сочетание — одно действие
+  if (combo) next[action] = combo;
+  patchSettings({ hotkeys: next });
+  hkRender();
+}
+
+/** Захват сочетания в popup (capture-фаза): Esc/Tab — отмена, чистый модификатор
+ *  (без клавиши) игнорируется, занятое другим действием — короткая вспышка «занято».
+ *  С v1.8.1 одиночные клавиши (R, F3, Space, цифры) тоже назначаются. */
+const HK_MOD_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'ContextMenu']);
+function hkCapture(e) {
+  if (!hkListening) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.key === 'Escape' || e.key === 'Tab') { hkListening = null; hkRender(); return; }
+  if (HK_MOD_KEYS.has(e.key)) return; // зажат только модификатор — ждём саму клавишу
+  const combo = formatCombo(e);
+  if (!combo) return;
+  const { action } = hkListening;
+  hkListening = null;
+  const taken = Object.entries(settings?.hotkeys || {}).find(([k, v]) => v === combo && k !== action);
+  if (taken) {
+    const b = $(`hk-${action}`);
+    if (b) b.textContent = t('hkTaken'); // вспышка; реальный рендер вернёт подписи через мгновение
+    setTimeout(hkRender, 1200);
+    return;
+  }
+  hkSave(action, combo);
+  // ясная обратная связь: чип мигает зелёным, чтобы было видно, что клавиша записалась
+  const b = $(`hk-${action}`);
+  if (b) {
+    b.classList.add('just-set');
+    setTimeout(() => b.classList.remove('just-set'), 1400);
+  }
+}
+
 // ---------------- рендер ----------------
 
 function renderAll() {
@@ -430,6 +540,7 @@ function renderAll() {
   renderLlm();
   renderLangs();
   renderToggles();
+  hkRender(); // подписи чипов горячих клавиш (v1.8.0)
 }
 
 /** Перерисовка «хрома»: классы/видимость. Безопасно звать после любого изменения настроек. */
@@ -543,8 +654,9 @@ function renderLangs() {
 
 function renderToggles() {
   const auto = $('auto-translate'), free = $('free-text'), conf = $('min-confidence'),
-    confVal = $('conf-val'), peek = $('peek-original');
+    confVal = $('conf-val'), peek = $('peek-original'), stitch = $('page-stitch');
   if (auto) auto.checked = !!settings.autoTranslate;
+  if (stitch) stitch.checked = !!settings.pageStitch;
   if (free) free.checked = !!settings.translateFreeText;
   if (conf) conf.value = settings.minConfidence;
   if (confVal) confVal.textContent = `${Math.round(settings.minConfidence * 100)}%`;
@@ -1156,6 +1268,26 @@ async function testLlm() {
 
 // ---------------- прогресс страницы ----------------
 
+/** Кнопка в режим «Остановить» и обратно (v1.10.0). */
+function setBtnStop(id, on) {
+  const btn = $(id);
+  if (!btn) return;
+  if (on) {
+    if (btn.dataset.stop === '1') return;
+    btn.dataset.mtlLabel = btn.textContent;
+    btn.dataset.stop = '1';
+    btn.textContent = t('stopBtn');
+    btn.disabled = false; // клик теперь не запуск, а остановка
+  } else {
+    if (btn.dataset.stop === '1') {
+      btn.textContent = btn.dataset.mtlLabel || btn.textContent;
+      delete btn.dataset.stop;
+      delete btn.dataset.mtlLabel;
+    }
+    btn.disabled = false;
+  }
+}
+
 function setPageProgress(job) {
   const wrap = $('page-progress');
   const fill = $('page-fill');
@@ -1168,6 +1300,10 @@ function setPageProgress(job) {
     text.textContent = job.debug
       ? (job.total ? t('pageDetect', { done: job.done, total: job.total, pct }) : t('pageDetectCollect'))
       : (job.total ? t('pageTrans', { done: job.done, total: job.total, pct }) : t('pageCollect'));
+    // кнопка-инициатор задачи превращается в «Остановить»
+    setBtnStop('translate-page', job.kind === 'translate');
+    setBtnStop('load-all-page', job.kind === 'loadAll');
+    setBtnStop('debug-page', job.kind === 'debug');
   } else {
     if (job?.error) {
       wrap.classList.remove('hidden');
@@ -1175,14 +1311,19 @@ function setPageProgress(job) {
       fill.style.background = 'var(--err)';
       text.textContent = job.error;
       setTimeout(() => { fill.style.background = ''; wrap.classList.add('hidden'); }, 10000);
+    } else if (job?.stopped) {
+      // «Остановлено: N / M» — ненадолго, затем полоса прячется
+      wrap.classList.remove('hidden');
+      fill.style.width = '100%';
+      text.textContent = t('pageStopped', { done: job.done || 0, total: job.total || 0 });
+      setTimeout(() => { wrap.classList.add('hidden'); }, 6000);
     } else {
       wrap.classList.add('hidden');
     }
     uiLock = false;
-    const btn = $('translate-page');
-    if (btn) btn.disabled = false;
-    const dbg = $('debug-page');
-    if (dbg) dbg.disabled = false;
+    setBtnStop('translate-page', false);
+    setBtnStop('load-all-page', false);
+    setBtnStop('debug-page', false);
   }
 }
 

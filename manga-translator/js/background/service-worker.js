@@ -2,7 +2,7 @@
 // Собирается скриптом scripts/build_sw_bundle.mjs из модулей js/lib/*.js и js/background/sw_main.js.
 // Это ОДИН классический скрипт без ES-модулей, чтобы регистрация service worker
 // не могла сломаться из-за загрузки модулей.
-// Сгенерирован: 2026-11-12T20:53:10.102Z
+// Сгенерирован: 2026-11-14T03:12:13.031Z
 'use strict';
 
 // ================= js/lib/protocol.js =================
@@ -20,6 +20,7 @@ const MSG = {
   TRANSLATE_TEXTS: 'TRANSLATE_TEXTS',   // popup → background (тест): { texts }
   TEST_LLM: 'TEST_LLM',                 // popup → background: проверить соединение
   TRANSLATE_PAGE: 'TRANSLATE_PAGE',     // popup → background → content: перевести всё
+  PAGE_JOB_STOP: 'PAGE_JOB_STOP',       // popup → background → content: остановить перевод/сбор (v1.10.0)
   CLEAR_TRANSLATIONS: 'CLEAR_TRANSLATIONS', // popup → background → content: убрать все переводы
   PAGE_PROGRESS: 'PAGE_PROGRESS',       // background → popup: прогресс страницы
   MODEL_PROGRESS: 'MODEL_PROGRESS',     // background → popup: прогресс загрузки моделей
@@ -42,8 +43,9 @@ const DEFAULT_SETTINGS = {
   promptLang: 'ru',            // 'ru' | 'en' — язык промпта для LLM
   sourceLang: 'auto',          // 'auto' | 'en' | 'ja' | 'zh' | 'ko'
   targetLang: 'ru',
-  autoTranslate: true,
-  translateFreeText: true,     // текст вне пузырей (SFX, подписи)
+  autoTranslate: false,        // v1.8.1: по умолчанию ВЫКЛЮЧЕН — включается тумблером на Home
+  pageStitch: true,            // v1.10.1: включена с самой установки — реплики, разрезанные краем страницы, докрашиваются по «шву» (v1.9.0)
+  translateFreeText: true,     // текст вне пузырей (SFX, подписи); с v1.8.1 всегда включён, тумблер удалён
   detectorModel: 'rtdetr-s',
   ocrModel: 'ppocrv6-manga',
   minConfidence: 0.5,
@@ -53,6 +55,13 @@ const DEFAULT_SETTINGS = {
   overlayStyle: 'light',      // 'light' | 'dark'
   autoTextColor: true,        // автоцвет: тёмный/светлый текст по фону пузыря (только 'inpaint')
   showOriginalOnHover: true,
+  // горячие клавиши контент-скрипта (v1.8.0): строка 'Ctrl+Alt+T' или '' — не назначено
+  hotkeys: {
+    translatePage: '',
+    loadAll: '',
+    debugPage: '',
+    clearPage: '',
+  },
 };
 
 const LANGUAGES = {
@@ -85,8 +94,34 @@ function mergeSettings(saved) {
   // белый список режимов вывода (v1.3.0: + 'inpaint_rect' — «прямоугольно»)
   if (!['inpaint', 'inpaint_rect', 'badge'].includes(out.renderMode)) out.renderMode = 'inpaint';
   if (out.fontFit !== 'fixed') out.fontFit = 'auto'; // устойчивость к мусору в storage
+  out.translateFreeText = true; // v1.8.1: тумблер «Вне пузырей» удалён — функция всегда включена
   return out;
 }
+
+/** Нормализовать нажатие клавиши в строку 'Ctrl+Alt+T' или одиночную 'R'.
+ *  Нужна popup (запись бинда) и content (срабатывание); в content script
+ *  продублирована локально — ES-импорт туда не доезжает. С v1.8.1 одиночные
+ *  клавиши тоже назначаются (R, F3, Space…) — content script сам пропускает
+ *  нажатия, пока пользователь печатает в поле на странице. */
+function formatCombo(e) {
+  const mods = [e.ctrlKey && 'Ctrl', e.altKey && 'Alt', e.shiftKey && 'Shift', e.metaKey && 'Meta'].filter(Boolean);
+  let key = '';
+  const c = String(e.code || '');
+  if (c.startsWith('Key')) key = c.slice(3);            // KeyX → X (физическая клавиша, независима от раскладки)
+  else if (c.startsWith('Digit')) key = c.slice(5);      // Digit5 → 5
+  else if (c === 'Space') key = 'Space';
+  else if (/^Arrow|^Numpad\d|^F\d{1,2}$/.test(c)) key = c.replace('Arrow', ''); // ArrowUp → Up
+  else if (PUNCT[c]) key = PUNCT[c];                     // знаки: Comma → ',' и т.п.
+  else if (e.key && e.key.length === 1) key = e.key.toUpperCase();
+  if (!key) return '';
+  return [...mods, key].join('+');
+}
+
+// e.code → читаемый знак (именованные клавиши пунктуации)
+const PUNCT = {
+  Comma: ',', Period: '.', Slash: '/', Backslash: '\\', Semicolon: ';', Quote: "'",
+  Minus: '-', Equal: '=', BracketLeft: '[', BracketRight: ']', Backquote: '`',
+};
 
 // ================= js/lib/zipread.js =================
 // zipread.js — чтение ZIP-архивов без внешних зависимостей.
@@ -1441,7 +1476,22 @@ let offscreenLastUsed = 0;
 
 // ---------------- настройки ----------------
 
+// v1.10.1: склейка страниц включается по умолчанию — в том числе у тех, кто
+// обновился с версий, где она была выключена. Однократно (флаг stitchMigrated);
+// если пользователь после этого выключил её сам — его выбор уважается.
+let stitchMigrationChecked = false;
+async function migrateStitchDefault() {
+  if (stitchMigrationChecked) return;
+  stitchMigrationChecked = true;
+  const { settings, stitchMigrated } = await chrome.storage.local.get(['settings', 'stitchMigrated']);
+  if (stitchMigrated) return;
+  const merged = mergeSettings(settings);
+  merged.pageStitch = true;
+  await chrome.storage.local.set({ settings: merged, stitchMigrated: true });
+}
+
 async function getSettings() {
+  await migrateStitchDefault();
   const { settings } = await chrome.storage.local.get('settings');
   return mergeSettings(settings);
 }
@@ -1654,9 +1704,12 @@ async function repairMissingModels(missing) {
   return done > 0;
 }
 
-async function handleTranslateImage(image, debug = false) {
+async function handleTranslateImage(image, debug = false, opts = {}) {
   const settings = await getSettings();
   const { customOcr = [] } = await chrome.storage.local.get('customOcr');
+  // ocrOnly (v1.9.0, склейка страниц): нужен только текст шва — детекция+OCR
+  // без перевода; renderMode 'badge' отключает inpaint в offscreen
+  const runSettings = opts.ocrOnly ? { ...settings, renderMode: 'badge' } : settings;
   const vision = visionFromSettings(settings);
   if (vision && (!vision.llmBaseUrl || !vision.llmModel)) {
     return {
@@ -1673,7 +1726,7 @@ async function handleTranslateImage(image, debug = false) {
     // missingLabels: названия моделей для понятной ошибки на странице
     return { ok: false, error: 'NOT_DOWNLOADED', missing, missingLabels: describeMissing(missing, customOcr) };
   }
-  const res = await runPipeline(image, settings);
+  const res = await runPipeline(image, runSettings);
   if (!res?.ok) return { ok: false, error: res?.error || 'pipeline failed' };
   // Vision: вызовы были, но ВСЕ не удались — пустой результат ничего не скажет,
   // отдаём диагностичную ошибку (обычно модель без поддержки изображений)
@@ -1742,12 +1795,48 @@ async function broadcastPage() {
   await chrome.storage.local.set({ pageJob });
 }
 
-async function finishPageJob(error) {
-  pageJob = { active: false, done: pageJob.done, total: pageJob.total, error: error || null };
+async function finishPageJob(error, extra = {}) {
+  pageJob = { active: false, done: pageJob.done, total: pageJob.total, error: error || null, ...extra };
   await broadcastPage();
 }
 
-async function startTranslatePage(debug = false) {
+// Контент-скрипт мог остаться от предыдущей версии расширения: вкладка манги
+// открыта с прошлого дня, а расширение обновилось — старый скрипт отвечает на
+// команды, но не знает новых флагов (preload «Загрузить всё», hotkeys). Сверяем
+// версию: при несовпадении перезагружаем вкладку — после неё Chrome сам
+// инжектит актуальный content script. Один раз после обновления, дальше мгновенно.
+// тег сборки контент-скрипта: при правках без смены версии расширения
+// обновить здесь И в content.js (window.__mtlBuild) — устаревшие вкладки
+// перезагрузятся сами при первой команде страницы
+const CONTENT_BUILD = 'st3';
+
+async function contentVersionMatches(tabId) {
+  try {
+    const r = await chrome.tabs.sendMessage(tabId, { type: MSG.PING });
+    return !!(r?.ok && r.v === chrome.runtime.getManifest().version && r.b === CONTENT_BUILD);
+  } catch (e) {
+    return false; // приёмника нет вообще (или file:// без разрешения)
+  }
+}
+
+function waitTabComplete(tabId, timeoutMs = 20000) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve(false);
+    }, timeoutMs);
+    const listener = (id, info) => {
+      if (id === tabId && info.status === 'complete') {
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve(true);
+      }
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
+async function startTranslatePage(debug = false, preload = false) {
   const settings = await getSettings();
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) {
@@ -1764,14 +1853,25 @@ async function startTranslatePage(debug = false) {
     return;
   }
 
-  pageJob = { active: true, done: 0, total: 0, error: null };
+  // устаревший (или отсутствующий) контент-скрипт: перезагружаем вкладку
+  if (!(await contentVersionMatches(tab.id))) {
+    try {
+      await chrome.tabs.reload(tab.id);
+      await waitTabComplete(tab.id);
+    } catch (e) { /* chrome:// и file:// без разрешения — ответим ошибкой ниже */ }
+  }
+
+  pageJob = {
+    active: true, done: 0, total: 0, error: null,
+    kind: debug ? 'debug' : (preload ? 'loadAll' : 'translate'), // чья кнопка станет «Остановить»
+  };
   pageJobLastBeat = Date.now();
   await broadcastPage();
 
   // команда контент-скрипту; если он не отвечает — сразу понятная ошибка
   let responded = false;
   try {
-    const res = await chrome.tabs.sendMessage(tab.id, { type: MSG.TRANSLATE_PAGE, debug });
+    const res = await chrome.tabs.sendMessage(tab.id, { type: MSG.TRANSLATE_PAGE, debug, preload });
     responded = !!res?.ok;
   } catch (e) {
     responded = false;
@@ -1791,6 +1891,23 @@ setInterval(async () => {
     await finishPageJob('Превышено время ожидания ответа от страницы. Проверьте, что открыта страница с мангой, и попробуйте ещё раз.');
   }
 }, 15_000);
+
+// «Остановить» (v1.10.0): просим контент-скрипт прервать цикл перевода/сбора.
+// Контент досматривает текущую картинку (или сразу возвращает камеру на место,
+// если стоп пришёл во время сбора) и присылает финальный отчёт finished+stopped;
+// если вкладка молчит — закрываем задачу сами через 2.5 с.
+async function stopTranslatePage() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (tab?.id) {
+    try { await chrome.tabs.sendMessage(tab.id, { type: MSG.PAGE_JOB_STOP }); } catch (e) { /* приёмника нет */ }
+  }
+  if (pageJob.active) {
+    setTimeout(() => {
+      if (pageJob.active) finishPageJob(null, { stopped: true }).catch(() => {});
+    }, 2500);
+  }
+  return { ok: true };
+}
 
 // «Стереть перевод»: убрать оверлеи и кэш на активной вкладке.
 // Отдельно от TRANSLATE_PAGE — без pageJob, прогресса и сторожа.
@@ -1929,7 +2046,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
 
         case MSG.TRANSLATE_IMAGE:
-          sendResponse(await handleTranslateImage(msg.image, !!msg.debug));
+          sendResponse(await handleTranslateImage(msg.image, !!msg.debug, { ocrOnly: !!msg.ocrOnly }));
           break;
 
         case MSG.TRANSLATE_TEXTS: {
@@ -1986,7 +2103,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
 
         case MSG.TRANSLATE_PAGE:
-          await startTranslatePage(!!msg.debug);
+          await startTranslatePage(!!msg.debug, !!msg.preload);
           sendResponse({ ok: true });
           break;
 
@@ -1995,7 +2112,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
 
         case 'PAGE_PROGRESS_REPORT': {
-          // от content script: {done, total, finished, error, debug}
+          // от content script: {done, total, finished, stopped, error, debug}
           pageJobLastBeat = Date.now();
           pageJob = {
             active: !msg.finished,
@@ -2003,12 +2120,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             total: msg.total || 0,
             error: msg.error || null,
             debug: !!msg.debug,
+            kind: pageJob.kind || 'translate',
+            stopped: !!msg.stopped,
           };
           await broadcastPage();
           offscreenLastUsed = Date.now();
           sendResponse({ ok: true });
           break;
         }
+
+        case MSG.PAGE_JOB_STOP:
+          sendResponse(await stopTranslatePage());
+          break;
 
         case 'FETCH_IMAGE': {
           // content script не может прочитать кросс-доменную картинку в canvas — качаем байты

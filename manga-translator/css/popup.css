@@ -225,6 +225,42 @@ input[type="range"] { width: 100%; accent-color: var(--accent); height: 22px; cu
 }
 .big-btn.ghost:hover { background: #22d3ee12; border-color: var(--accent); }
 
+/* ---------- ряды «действие + горячая клавиша» (v1.8.0) ---------- */
+/* заголовок блока: слева «Функции», справа подпись над колонкой чипов */
+.row-labels { display: flex; justify-content: space-between; align-items: baseline; }
+.hk-cap {
+  width: 92px; text-align: center; font: 500 10px/1 inherit; letter-spacing: .02em;
+  color: var(--muted); text-transform: lowercase;
+}
+/* кнопка в ряду растягивается, справа — чип назначения клавиши */
+.action-row { display: flex; gap: 8px; align-items: stretch; }
+.action-row .big-btn { flex: 1; min-width: 0; margin-top: 0; }
+.big-btn.load-all {
+  background: linear-gradient(135deg, #7c5cff24, #22d3ee1f);
+  border-color: #7c5cff66; color: #c9b8ff;
+}
+.big-btn.load-all:hover { background: linear-gradient(135deg, #7c5cff38, #22d3ee30); }
+.bind-key {
+  flex: none; width: 92px; border: 1px dashed var(--border); border-radius: 12px;
+  background: transparent; color: var(--muted); font: 600 11px/1 inherit; cursor: pointer;
+  padding: 0 4px;
+}
+.bind-key:hover { border-color: var(--accent-dim); color: var(--text); }
+.bind-key.listening {
+  border-style: solid; border-color: var(--accent); color: var(--accent);
+  background: #22d3ee14; animation: hkPulse 1.2s ease-in-out infinite;
+}
+@keyframes hkPulse {
+  0%, 100% { box-shadow: 0 0 0 0 #22d3ee00; }
+  50% { box-shadow: 0 0 10px 1px #22d3ee44; }
+}
+.bind-key.set { border-style: solid; color: var(--text); border-color: #3a3547; }
+/* клавиша только что записалась — зелёная вспышка, чтобы это было видно */
+.bind-key.just-set {
+  border-style: solid; border-color: var(--ok); color: var(--ok);
+  background: #4ade8014; animation: none;
+}
+
 .progress-card { display: flex; flex-direction: column; gap: 7px; }
 .progress-card.hidden { display: none; }
 .bar { height: 6px; background: #12101736; border-radius: 999px; overflow: hidden; }

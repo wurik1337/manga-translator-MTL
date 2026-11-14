@@ -6,13 +6,23 @@
 
   if (window.__mtlContentLoaded) return;
   window.__mtlContentLoaded = true;
+  // версия контент-скрипта: background сверяет её при командах страницы и
+  // перезагружает вкладку, если в давно открытой вкладке остался скрипт от
+  // предыдущей версии расширения (без preload/hotkeys). Обновлять при релизе.
+  window.__mtlVersion = '1.10.1';
+  // тег сборки: меняется при правках контент-скрипта БЕЗ смены версии
+  // расширения — background сверяет и перезагружает устаревшие вкладки
+  window.__mtlBuild = 'st3';
 
   // --- константы (копия protocol.js; import в content script недоступен) ---
   const M = {
     GET_SETTINGS: 'GET_SETTINGS',
     SET_SETTINGS: 'SET_SETTINGS',
+    PING: 'PING',
     TRANSLATE_IMAGE: 'TRANSLATE_IMAGE',
+    TRANSLATE_TEXTS: 'TRANSLATE_TEXTS', // v1.9.0: перевод объединённой реплики (склейка страниц)
     TRANSLATE_PAGE: 'TRANSLATE_PAGE',
+    PAGE_JOB_STOP: 'PAGE_JOB_STOP',     // v1.10.0: «Остановить» из popup
     CLEAR_TRANSLATIONS: 'CLEAR_TRANSLATIONS', // v1.3.0: «Стереть перевод» из popup
     PAGE_PROGRESS_REPORT: 'PAGE_PROGRESS_REPORT',
     FETCH_IMAGE: 'FETCH_IMAGE',
@@ -99,7 +109,6 @@
   transition:opacity .15s ease;box-sizing:border-box}
 .mtl-box.mtl-light{background:rgba(255,255,255,.96);color:#101014;box-shadow:0 0 0 1px rgba(0,0,0,.25)}
 .mtl-box.mtl-dark{background:rgba(18,16,24,.95);color:#f2f0f6;box-shadow:0 0 0 1px rgba(255,255,255,.18)}
-.mtl-box.mtl-peek{opacity:0}
 .mtl-box.mtl-fallback{color:#666;opacity:.92;font-style:italic}
 .mtl-badge{position:absolute;transform:translate(-50%,-50%);width:auto;max-width:96%;
   padding:5px 10px;border-radius:9px;line-height:1.2;text-align:center;
@@ -107,7 +116,6 @@
   box-shadow:0 2px 8px rgba(0,0,0,.35);transition:opacity .15s ease;box-sizing:border-box}
 .mtl-badge.mtl-light{background:rgba(255,255,255,.9);color:#101014;border:1px solid rgba(0,0,0,.2)}
 .mtl-badge.mtl-dark{background:rgba(18,16,24,.9);color:#f2f0f6;border:1px solid rgba(255,255,255,.2)}
-.mtl-badge.mtl-peek{opacity:0}
 .mtl-pill{position:absolute;z-index:2147483001;display:flex;align-items:center;gap:6px;
   background:#16131f;color:#22d3ee;border:1px solid #22d3ee88;border-radius:999px;
   padding:6px 12px;font:600 13px/1 system-ui,-apple-system,sans-serif;cursor:pointer;
@@ -149,7 +157,9 @@
 .mtl-pill-frame svg{width:14px;height:14px}
 .mtl-canvas{position:absolute;left:0;top:0;width:100%;height:100%;
   transition:opacity .15s ease;image-rendering:auto}
-.mtl-overlay.mtl-peeking .mtl-canvas{opacity:0}
+.mtl-overlay.mtl-peeking .mtl-canvas,
+.mtl-overlay.mtl-peeking .mtl-box,
+.mtl-overlay.mtl-peeking .mtl-badge{opacity:0}
 `;
     document.documentElement.appendChild(st);
   }
@@ -318,12 +328,19 @@
   }
 
   function refreshAllOverlays() {
-    for (const el of knownTargets()) positionOverlay(el);
+    // только смонтированные (в окне видимости): раньше здесь на каждый кадр
+    // скролла обходились ВСЕ цели — заметная часть подвисания на 100+ страницах
+    for (const el of knownTargets()) {
+      const st = state.get(el);
+      if (st?.overlay?.isConnected) positionOverlay(el);
+    }
   }
 
   const allTargetsSet = new Set();
   function track(el) {
     allTargetsSet.add(el);
+    // окно видимости: маунт/анмаунт оверлеев при скролле (v1.10.0)
+    if (settings?.enabled && winObserver) winObserver.observe(el);
     if (allTargetsSet.size > 400) { // не копим бесконечно
       const it = allTargetsSet.values().next().value;
       const st = state.get(it);
@@ -384,10 +401,13 @@
     return new ImageData(new Uint8ClampedArray(u8.buffer), w, h);
   }
 
-  /** Очищенная картинка + переводы, нарисованные прямо в пузырях. */
-  function renderInpaintText(el, items, natW, natH) {
+  /** Очищенная картинка + переводы, нарисованные прямо в пузырях.
+   *  source (v1.10.0): ImageData из состояния или ImageBitmap из запечённого
+   *  блоба; без source берётся st.cleanImageData. */
+  function renderInpaintText(el, items, natW, natH, source = null) {
     const st = state.get(el);
-    if (!st?.cleanImageData || st.cleanImageData.width !== natW || st.cleanImageData.height !== natH) return false;
+    const px = source || st?.cleanImageData || null;
+    if (!px || px.width !== natW || px.height !== natH) return false;
     if (!self.MTLTextLayout) return false; // старый content script без textlayout — фолбэк на плашки
 
     const o = ensureOverlay(el);
@@ -397,15 +417,28 @@
     canvas.width = natW;
     canvas.height = natH;
     const ctx = canvas.getContext('2d');
-    ctx.putImageData(st.cleanImageData, 0, 0);
+    if (source) ctx.drawImage(source, 0, 0, natW, natH);
+    else ctx.putImageData(st.cleanImageData, 0, 0);
 
     const measure = self.MTLTextLayout.canvasMeasure(measureCtx);
     // автоцвет — только в режиме «Стирать текст»: цвет каждого блока
-    // выбирается по яркости очищенного фона под ним (дешёвая сетка по
-    // уже посчитанному cleanImageData); не получилось — ручной цвет
+    // выбирается по яркости очищенного фона под ним. ImageData читается
+    // напрямую; для битмапа из блоба берём маленький кроп с канваса.
     const autoColor = settings?.renderMode === 'inpaint' && settings?.autoTextColor !== false;
     const manualColor = settings?.overlayStyle === 'dark' ? '#f2f0f6' : '#111111';
+    const colorOf = (b) => {
+      if (!autoColor) return null;
+      if (!source) return self.MTLTextLayout.pickTextColor(st.cleanImageData, b);
+      const x = Math.max(0, b[0]), y = Math.max(0, b[1]);
+      const w = Math.min(natW - x, b[2] - b[0]);
+      const h = Math.min(natH - y, b[3] - b[1]);
+      if (w < 2 || h < 2) return null;
+      return self.MTLTextLayout.pickTextColor(ctx.getImageData(x, y, w, h), [0, 0, w, h]);
+    };
     for (const it of items) {
+      // половинка, уехавшая в склейку страниц: текст стёрт, полный перевод
+      // рисуется на соседней странице — здесь ничего не пишем
+      if (it.stitchMerged) continue;
       const text = it.translation || it.text;
       if (!text || !text.trim()) continue;
       // drawBox — тесный интерьер пузыря (offscreen считает его по очищенной
@@ -415,7 +448,7 @@
       self.MTLTextLayout.drawTextBlock(ctx, text, b, {
         fontFit: settings?.fontFit === 'fixed' ? 'fixed' : 'auto',
         fontSizeFixed: Number(settings?.fontSizeFixed) || 18,
-        color: (autoColor && self.MTLTextLayout.pickTextColor(st.cleanImageData, b)) || manualColor,
+        color: colorOf(b) || manualColor,
         measure,
         min: 8,
         max: 72,
@@ -424,20 +457,25 @@
     }
     o.appendChild(canvas);
 
-    // «показать оригинал при наведении»: канвас прозрачный, под ним исходная картинка
-    if (settings?.showOriginalOnHover && !el.__mtlPeekBound) {
-      el.__mtlPeekBound = true;
-      el.addEventListener('mouseenter', () => {
-        const s = state.get(el);
-        s?.overlay?.classList.add('mtl-peeking');
-      });
-      el.addEventListener('mouseleave', () => {
-        const s = state.get(el);
-        s?.overlay?.classList.remove('mtl-peeking');
-      });
-    }
+    bindPeekOnHover(el);
     positionOverlay(el);
     return true;
+  }
+
+  /** «Оригинал при наведении»: слушатель вешается на саму картинку, а не на
+   *  бейджи/плашки — оверлей у нас pointer-events:none, события до них не
+   *  доходят (v1.10.1: раньше в режиме «Рамки» из-за этого peek не работал).
+   *  Класс mtl-peeking прячет канвас («Стирать текст») и рамки/плашки —
+   *  под ними виден оригинал с исходным текстом. */
+  function bindPeekOnHover(el) {
+    if (!settings?.showOriginalOnHover || el.__mtlPeekBound) return;
+    el.__mtlPeekBound = true;
+    el.addEventListener('mouseenter', () => {
+      state.get(el)?.overlay?.classList.add('mtl-peeking');
+    });
+    el.addEventListener('mouseleave', () => {
+      state.get(el)?.overlay?.classList.remove('mtl-peeking');
+    });
   }
 
   /** Динамический кегль бейджа: текст вписывается в рамку (96% ширины блока,
@@ -459,15 +497,16 @@
     box.style.fontSize = `${lo}px`;
   }
 
-  function renderResults(el, items, natW, natH) {
+  function renderResults(el, items, natW, natH, source = null) {
     // основной режим: очищенная от текста картинка + текст в пузырях
-    if (settings?.renderMode !== 'badge' && renderInpaintText(el, items, natW, natH)) return;
+    if (settings?.renderMode !== 'badge' && renderInpaintText(el, items, natW, natH, source)) return;
 
     const o = ensureOverlay(el);
     clearOverlayContent(el);
     const badgeMode = settings?.renderMode === 'badge';
     const overlayH = o.clientHeight || natH;
     for (const it of items) {
+      if (it.stitchMerged) continue; // половинка уехала в склейку — рамку не рисуем
       const [x0, y0, x1, y1] = it.box;
       const text = it.translation || it.text;
       const theme = settings?.overlayStyle === 'dark' ? 'mtl-dark' : 'mtl-light';
@@ -479,10 +518,6 @@
         box.style.left = `${(((x0 + x1) / 2) / natW) * 100}%`;
         box.style.top = `${(((y0 + y1) / 2) / natH) * 100}%`;
         box.style.maxWidth = `${Math.max(30, ((x1 - x0) / natW) * 96)}%`;
-        if (settings?.showOriginalOnHover) {
-          box.addEventListener('mouseenter', () => box.classList.add('mtl-peek'));
-          box.addEventListener('mouseleave', () => box.classList.remove('mtl-peek'));
-        }
         o.appendChild(box);
         // динамический кегль: вписываем текст в рамку, когда бейдж уже в DOM
         const regionDisplayW = ((x1 - x0) / natW) * (o.clientWidth || natW);
@@ -499,14 +534,11 @@
       box.style.width = `${((x1 - x0) / natW) * 100}%`;
       box.style.height = `${((y1 - y0) / natH) * 100}%`;
       if (!it.translation) box.classList.add('mtl-fallback');
-      if (settings?.showOriginalOnHover) {
-        box.addEventListener('mouseenter', () => box.classList.add('mtl-peek'));
-        box.addEventListener('mouseleave', () => box.classList.remove('mtl-peek'));
-      }
       o.appendChild(box);
       // подбор кегля — когда плашка уже в DOM: clientWidth/Height реальные
       fitText(box, text);
     }
+    bindPeekOnHover(el);
     positionOverlay(el);
   }
 
@@ -572,7 +604,9 @@
     st.status = 'processing';
     state.set(el, st);
     track(el);
-    showSpinner(el);
+    // спиннер только в окне видимости: при «Загрузить всё» дальние картинки
+    // обрабатываются без DOM-мусора на экране
+    if (nearViewport(el)) showSpinner(el);
 
     try {
       const src = el instanceof HTMLImageElement ? (el.currentSrc || el.src) : el.__mtlBgUrl;
@@ -614,7 +648,9 @@
           try { st.cleanImageData = b64ToImageData(res.image.rgbaB64, res.image.width, res.image.height); }
           catch (e) { /* без очищенной картинки рисуем плашки */ }
         }
-        if (cacheKey && resultCache.size > 60) resultCache.delete(resultCache.keys().next().value);
+        // кэш результатов: items маленькие, поднимаем лимит, чтобы при
+        // скролле длинных глав (100+ страниц) маунт находил готовые тексты
+        if (cacheKey && resultCache.size > 400) resultCache.delete(resultCache.keys().next().value);
         resultCache.set(cacheKey, { items, natW, natH });
       }
 
@@ -630,16 +666,265 @@
       st2.status = 'done';
       state.set(el, st2);
       if (!items.length) {
-        clearOverlayContent(el);
+        if (nearViewport(el)) clearOverlayContent(el);
         return;
       }
-      renderResults(el, items, natW, natH);
+      // рисуем сразу только в окне видимости; дальние страницы дождутся
+      // скролла (маунт по IntersectionObserver), пиксели уедут в блоб
+      if (nearViewport(el)) renderResults(el, items, natW, natH);
+      bakeCleanBlob(el, src);
+      if (!debug) scheduleStitch(el); // v1.9.0: склейка страниц
     } catch (e) {
       const st3 = state.get(el) || {};
       st3.status = 'error';
+      st3.errText = String(e?.message || e).slice(0, 120);
       state.set(el, st3);
       if (isCtxDead(e)) { clearOverlayContent(el); showCtxBanner(); return; } // без тостов на каждой картинке
-      showError(el, String(e?.message || e).slice(0, 120));
+      if (nearViewport(el)) showError(el, st3.errText);
+    }
+  }
+
+  // ---------------- окно видимости (v1.10.0) ----------------
+
+  // «Загрузить всё и перевести» на длинных главах (100+ картинок) раньше
+  // держало в DOM канвас на каждую переведённую страницу плюс полноразмерные
+  // пиксели cleanImageData в состоянии — страница жёстко подвисала. Теперь
+  // оверлеи существуют только в окне вокруг экрана (±1.6 высоты экрана,
+  // IntersectionObserver), а чистые пиксели каждой страницы сразу запекаются
+  // в сжатый блоб: канвас и ImageData живут лишь у страниц в окне.
+
+  const WIN_MARGIN_FRAC = 1.6; // окно видимости: ±1.6 высоты экрана
+  const BLOB_CAP = 300;        // предел запечённых страниц (далее — редкий фолбэк на плашки)
+  const cleanBlobs = new Map(); // src → { blob, w, h } — сжатые чистые картинки
+
+  function nearViewport(el) {
+    const r = el.getBoundingClientRect();
+    if (!r.width && !r.height) return false;
+    const m = Math.max(window.innerHeight, 600) * WIN_MARGIN_FRAC;
+    return r.bottom > -m && r.top < window.innerHeight + m &&
+           r.right > -m && r.left < window.innerWidth + m;
+  }
+
+  let winObserver = null;
+  function ensureWinObserver() {
+    if (winObserver) return winObserver;
+    winObserver = new IntersectionObserver((entries) => {
+      for (const en of entries) {
+        if (en.isIntersecting) mountOverlay(en.target);
+        else unmountOverlay(en.target);
+      }
+      // rootMargin в процентах от экрана: маунт заранее, до прихода скролла
+    }, { rootMargin: `${Math.round(WIN_MARGIN_FRAC * 100)}% 0%` });
+    return winObserver;
+  }
+
+  /** Убрать оверлей из DOM; полноразмерные пиксели сбрасываем, если они
+   *  уже запечены в блоб (иначе оставим до конца запекания). */
+  function unmountOverlay(el) {
+    const st = state.get(el);
+    if (!st?.overlay) return;
+    st.overlay.remove();
+    st.overlay = null;
+    if (st.blobReady) st.cleanImageData = null;
+  }
+
+  /** Показать готовую страницу: из ImageData состояния либо из запечённого
+   *  блоба (декодировали → нарисовали → битмап освобождён). */
+  async function mountOverlay(el) {
+    const st = state.get(el);
+    if (!st || st.mounting) return;
+    if (st.status === 'processing') {
+      if (!st.overlay?.isConnected && nearViewport(el)) showSpinner(el);
+      return;
+    }
+    if (st.status === 'error') {
+      if (!st.overlay?.isConnected && nearViewport(el)) showError(el, st.errText || 'Ошибка');
+      return;
+    }
+    if (st.status !== 'done' || st.overlay?.isConnected) return;
+    const src = elSrc(el);
+    const cached = src && resultCache.get(src);
+    if (!cached?.items?.length) return;
+    if (settings?.renderMode !== 'badge' && !st.cleanImageData) {
+      const rec = cleanBlobs.get(src);
+      if (!rec || rec.w !== cached.natW || rec.h !== cached.natH) {
+        if (!st.blobReady) return; // запекание ещё в процессе — нарисуем при следующем заходе
+        renderResults(el, cached.items, cached.natW, cached.natH); // блоб вытеснен (редко) — фолбэк на плашки
+        return;
+      }
+      st.mounting = true;
+      try {
+        const bmp = await createImageBitmap(rec.blob);
+        try {
+          if (!nearViewport(el)) return; // пока декодировали — уже укатились из окна
+          renderResults(el, cached.items, cached.natW, cached.natH, bmp);
+        } finally {
+          bmp.close?.();
+        }
+      } catch (e) { /* битый блоб — окно пройдёт мимо */ }
+      finally { st.mounting = false; }
+      return;
+    }
+    renderResults(el, cached.items, cached.natW, cached.natH);
+  }
+
+  /** Чистые пиксели страницы → сжатый блоб (JPEG 0.92, PNG при альфе).
+   *  После запекания полноразмерный ImageData можно сбросить при выходе
+   *  страницы из окна видимости. */
+  function bakeCleanBlob(el, src) {
+    const st = state.get(el);
+    if (!st?.cleanImageData || !src || cleanBlobs.has(src) || st.blobReady) return;
+    const data = st.cleanImageData;
+    let hasAlpha = false;
+    for (let i = 3; i < data.data.length; i += 4 * 61) {
+      if (data.data[i] < 250) { hasAlpha = true; break; }
+    }
+    const c = document.createElement('canvas');
+    c.width = data.width;
+    c.height = data.height;
+    c.getContext('2d').putImageData(data, 0, 0);
+    c.toBlob((blob) => {
+      if (blob) {
+        cleanBlobs.set(src, { blob, w: data.width, h: data.height });
+        while (cleanBlobs.size > BLOB_CAP) {
+          cleanBlobs.delete(cleanBlobs.keys().next().value);
+        }
+      }
+      const s2 = state.get(el);
+      if (s2) {
+        s2.blobReady = true;
+        if (!s2.overlay?.isConnected) s2.cleanImageData = null; // страница вне окна
+      }
+    }, hasAlpha ? 'image/png' : 'image/jpeg', 0.92);
+  }
+
+  // ---------------- склейка страниц (v1.9.0) ----------------
+
+  // Реплика, разрезанная краем страницы: детектор видит текст, но OCR читает
+  // только половину. Тумблер «Склейка страниц» (settings.pageStitch) включает
+  // склейку ШВА: у пары соседних страниц берутся полоски вокруг стыка и
+  // склеиваются в одно маленькое изображение, OCR шва восстанавливает полный
+  // текст, перевод целиком рисуется на поздней странице, а половинка на ранней
+  // глушится (в «Стирать текст» она уже стёрта inpaint'ом, в «Рамках» — просто
+  // не рисуется). Порядок страниц — порядок в DOM (порядок чтения читалки).
+
+  const STITCH_LIB = self.MTLStitch || null;
+  const stitchInFlight = new Set(); // 'srcA|srcB' — этот шов уже обрабатывается
+
+  function elSrc(el) {
+    return el instanceof HTMLImageElement ? (el.currentSrc || el.src) : el.__mtlBgUrl;
+  }
+
+  function docOrder(a, b) {
+    if (a === b) return 0;
+    const pos = a.compareDocumentPosition(b);
+    return pos & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+  }
+
+  /** Соседи цели в порядке чтения страницы (сверху вниз по DOM). */
+  function stitchNeighbors(el) {
+    const list = collectTargets(false).sort(docOrder);
+    const i = list.indexOf(el);
+    return {
+      prev: i > 0 ? list[i - 1] : null,
+      next: i >= 0 && i < list.length - 1 ? list[i + 1] : null,
+    };
+  }
+
+  /** Перерисовать готовую цель из её (обновлённого) кэша. Цель вне окна
+   *  не трогаем — она нарисуется при маунте. */
+  function rerenderFromCache(el) {
+    const st = state.get(el);
+    if (!st || st.status !== 'done' || !st.overlay?.isConnected) return;
+    const src = elSrc(el);
+    const cached = src && resultCache.get(src);
+    if (!cached?.items?.length) return;
+    if (settings?.renderMode !== 'badge' && !st.cleanImageData) {
+      st.overlay = null; // пиксели живут в блобе — перерисовка через mountOverlay
+      mountOverlay(el);
+    } else {
+      renderResults(el, cached.items, cached.natW, cached.natH);
+    }
+  }
+
+  /** Точка входа: после успешного перевода цели пробуем склеить шов с соседом. */
+  function scheduleStitch(el) {
+    if (!settings?.pageStitch || !STITCH_LIB) return;
+    maybeStitch(el).catch(() => { /* склейка не должна ломать перевод */ });
+  }
+
+  async function maybeStitch(el) {
+    if (!settings?.pageStitch || !STITCH_LIB || ctxDead) return;
+    const mySrc = elSrc(el);
+    const mine = mySrc && resultCache.get(mySrc);
+    if (!mine?.items?.length) return;
+    const { prev, next } = stitchNeighbors(el);
+    // «моя страница начинается с обрывка» — склеиваемся с предыдущей;
+    // «кончается обрывком» — со следующей. Ранняя страница = с нижним
+    // обрывком, поздняя = с верхним; полный текст уезжает на позднюю.
+    if (prev && (await stitchPair(prev, el))) return;
+    if (next) await stitchPair(el, next);
+  }
+
+  /** Склейка пары страниц: ранняя (обрывок снизу) + поздняя (обрывок сверху). */
+  async function stitchPair(earlyEl, lateEl) {
+    const earlySrc = elSrc(earlyEl), lateSrc = elSrc(lateEl);
+    if (!earlySrc || !lateSrc) return false;
+    const pairKey = `${earlySrc}|${lateSrc}`;
+    if (stitchInFlight.has(pairKey)) return false;
+    const early = resultCache.get(earlySrc), late = resultCache.get(lateSrc);
+    if (!early?.items?.length || !late?.items?.length) return false;
+    const fragEarly = STITCH_LIB.edgeFragment(early.items, early.natH, 'bottom');
+    const fragLate = STITCH_LIB.edgeFragment(late.items, late.natH, 'top');
+    if (!fragEarly || !fragLate) return false;
+    stitchInFlight.add(pairKey);
+    try {
+      let full = null;
+      // пиксели обеих страниц: шов строится из полосок вокруг стыка
+      let earlyData = null, lateData = null;
+      try { earlyData = await extractImageData(earlyEl); } catch (e) { /* недоступна */ }
+      try { lateData = await extractImageData(lateEl); } catch (e) { /* недоступна */ }
+      if (earlyData && lateData) {
+        const seam = STITCH_LIB.buildSeam(earlyData, lateData);
+        // ocrOnly: детекция + OCR шва без перевода и без inpaint (фон вернёт
+        // только боксы и текст — как в отладке, но с флагом «не стирать»)
+        const res = await send({
+          type: M.TRANSLATE_IMAGE,
+          debug: true,
+          ocrOnly: true,
+          image: {
+            width: seam.imageData.width,
+            height: seam.imageData.height,
+            rgbaB64: rgbaToB64(seam.imageData.data),
+          },
+        });
+        if (res?.ok && Array.isArray(res.items)) {
+          // запасной вариант «тексты половинок» — только для двух пузырей:
+          // пузырь, обрезанный краем страницы, почти всегда разрезан им
+          const halves = fragEarly.kind === 'bubble' && fragLate.kind === 'bubble'
+            ? { a: fragEarly.text, b: fragLate.text }
+            : null;
+          full = STITCH_LIB.analyzeSeam(res.items, seam.junction, seam.imageData.height, halves);
+        }
+      }
+      if (!full) return false;
+      // перевод объединённой реплики (одна строка — один вызов)
+      const tr = await send({ type: M.TRANSLATE_TEXTS, texts: [full.text] });
+      const translation = tr?.ok && tr.translations?.[0] ? String(tr.translations[0]).trim() : null;
+      // поздняя страница: полный текст вместо половинки;
+      // ранняя: половинка глушится — inpaint её уже стёр, рамка убирается
+      fragLate.text = full.text;
+      if (translation) fragLate.translation = translation;
+      fragLate.stitchJoined = true;
+      fragEarly.stitchMerged = true;
+      delete fragEarly.translation;
+      rerenderFromCache(earlyEl);
+      rerenderFromCache(lateEl);
+      return true;
+    } catch (e) {
+      return false;
+    } finally {
+      stitchInFlight.delete(pairKey);
     }
   }
 
@@ -710,11 +995,13 @@
   function observeNew() {
     if (!settings?.enabled) return;
     const obs = ensureObserver();
+    const win = ensureWinObserver();
     for (const el of collectTargets()) {
       const st = state.get(el);
       if (!st || (st.status !== 'done' && st.status !== 'processing' && st.status !== 'error')) {
         obs.observe(el);
       }
+      win.observe(el); // окно видимости — для всех целей независимо от статуса
       track(el);
     }
   }
@@ -734,20 +1021,35 @@
   }
 
   let pageJobRunning = false;
-  async function translateAllPage(debug = false) {
+  let pageStopRequested = false; // «Остановить» (v1.10.0): сбрасывается при старте задачи
+
+  async function translateAllPage(debug = false, preload = false) {
     if (pageJobRunning) return;
     pageJobRunning = true;
+    pageStopRequested = false;
     try {
       reportProgress({ done: 0, total: 0 });
+      if (preload) await loadAllImages();
+      if (pageStopRequested) {
+        reportProgress({ done: 0, total: 0, finished: true, stopped: true, debug });
+        return;
+      }
       const targets = collectTargets(false);
-      // форсируем ленивую загрузку и ждём
+      // форсируем ленивую загрузку и ждём (порциями — чтобы «Остановить»
+      // срабатывало быстро даже на сотне картинок)
       const imgs = targets.filter(t => t instanceof HTMLImageElement);
-      await Promise.all(imgs.map(forceLoad));
+      for (let i = 0; i < imgs.length && !pageStopRequested; i += 8) {
+        await Promise.all(imgs.slice(i, i + 8).map(forceLoad));
+      }
+      if (pageStopRequested) {
+        reportProgress({ done: 0, total: 0, finished: true, stopped: true, debug });
+        return;
+      }
       const ready = collectTargets(true); // после загрузки список мог вырасти (+ фоны)
       const total = ready.length;
       let done = 0;
       for (const el of ready) {
-        if (ctxDead) break; // расширение перезапустилось — дальше идти бессмысленно
+        if (ctxDead || pageStopRequested) break; // расширение перезапустилось / нажали «Остановить»
         try {
           // force=false: уже отсканированное (в кэше) показывается мгновенно,
           // детекция запускается только для картинок, которых в кэше нет
@@ -756,7 +1058,7 @@
         done++;
         reportProgress({ done, total, debug });
       }
-      reportProgress({ done, total, finished: true, debug });
+      reportProgress({ done, total, finished: true, stopped: pageStopRequested, debug });
     } finally {
       pageJobRunning = false;
     }
@@ -765,8 +1067,19 @@
   // ---------------- реакция на команды/настройки ----------------
 
   chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
+    if (msg?.type === M.PING) {
+      // background по ответу понимает, какой версии контент-скрипт в вкладке
+      sendResponse({ ok: true, v: window.__mtlVersion || '0', b: window.__mtlBuild || '' });
+      return false;
+    }
     if (msg?.type === M.TRANSLATE_PAGE) {
-      translateAllPage(!!msg.debug);
+      translateAllPage(!!msg.debug, !!msg.preload);
+      sendResponse({ ok: true });
+      return false;
+    }
+    if (msg?.type === M.PAGE_JOB_STOP) {
+      // «Остановить» (v1.10.0): цикл перевода/сбора увидит флаг между шагами
+      pageStopRequested = true;
       sendResponse({ ok: true });
       return false;
     }
@@ -778,12 +1091,162 @@
     return false;
   });
 
+  /** «Загрузить и перевести всё» (v1.8.1). Сайты с ленивой загрузкой вставляют
+   *  дальние картинки только при прокрутке (comix.to и т.п.): проходим страницу
+   *  сверху вниз, докручиваем внутренние скролл-контейнеры, повторяем проходы,
+   *  пока страница растёт, и возвращаем камеру ровно на место — для пользователя
+   *  это короткая вспышка, положение экрана не меняется. Каждый шаг шлёт
+   *  «сигнал жизни» сторожу в background. */
+  const LOAD_STEP_MS = 280;     // пауза на шаге скролла — дать сайту начать загрузку
+  const LOAD_WAIT_MAX = 20000;  // предел ожидания дозагрузки картинок
+
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  /** Форс ленивых картинок в DOM: data-src-атрибуты и loading=lazy. */
+  function forceLazyAttrs() {
+    for (const img of document.images) {
+      if (img.loading === 'lazy') img.loading = 'eager';
+      if (!img.src) {
+        const alt = img.dataset.src || img.getAttribute('data-original')
+          || img.getAttribute('data-lazy-src') || img.getAttribute('data-lazy');
+        if (alt) img.src = alt;
+      }
+    }
+  }
+
+  /** Внутренние скролл-контейнеры (ридеры манги часто скроллят не окно, а div). */
+  function collectScrollables() {
+    const out = [];
+    for (const el of document.querySelectorAll('div, main, section, article')) {
+      const st = getComputedStyle(el);
+      if (!/auto|scroll/.test(st.overflowY || '')) continue;
+      if (el.scrollHeight > el.clientHeight + 200 && el.clientHeight > 200) out.push(el);
+      if (out.length >= 6) break;
+    }
+    return out;
+  }
+
+  /** Ждём дозагрузки картинок (поллинг), максимум maxMs. */
+  async function waitForImagesPending(maxMs) {
+    const t0 = Date.now();
+    for (;;) {
+      if (pageStopRequested) return; // «Остановить» — не ждём догрузку
+      const pending = [...document.images].filter(im => !im.complete);
+      if (!pending.length || Date.now() - t0 > maxMs) break;
+      reportProgress({ done: 0, total: 0 });
+      await sleep(500);
+    }
+  }
+
+  async function loadAllImages() {
+    const sc = document.scrollingElement || document.documentElement;
+    const savedY = window.scrollY;
+    const containers = collectScrollables();
+    const savedTops = containers.map(c => c.scrollTop);
+    const step = Math.max(Math.round(window.innerHeight * 0.9), 500);
+    // «Остановить» во время сбора: камера сразу на исходную и выход
+    const abortScroll = () => {
+      for (let i = 0; i < containers.length; i++) containers[i].scrollTop = savedTops[i];
+      window.scrollTo(0, savedY);
+    };
+    // проходы сверху вниз: страница по мере подгрузки растёт — повторяем,
+    // пока высота перестанет увеличиваться (максимум 3 прохода)
+    let lastHeight = 0;
+    for (let pass = 0; pass < 3; pass++) {
+      forceLazyAttrs();
+      for (let y = pass === 0 ? 0 : lastHeight; y <= sc.scrollHeight + step; y += step) {
+        if (pageStopRequested) { abortScroll(); return; }
+        window.scrollTo(0, y);
+        reportProgress({ done: 0, total: 0 });
+        await sleep(LOAD_STEP_MS);
+      }
+      if (pageStopRequested) { abortScroll(); return; }
+      const h = sc.scrollHeight;
+      await waitForImagesPending(4000);
+      if (h - lastHeight < window.innerHeight) break; // страница больше не растёт
+      lastHeight = h;
+    }
+    // внутренние скролл-контейнеры: прокручиваем и возвращаем на место
+    for (let i = 0; i < containers.length; i++) {
+      const c = containers[i];
+      const max = c.scrollHeight - c.clientHeight;
+      for (let t = 0; t <= max; t += Math.max(Math.round(c.clientHeight * 0.9), 400)) {
+        if (pageStopRequested) { abortScroll(); return; }
+        c.scrollTop = t;
+        reportProgress({ done: 0, total: 0 });
+        await sleep(LOAD_STEP_MS);
+      }
+      c.scrollTop = savedTops[i];
+      if (pageStopRequested) { abortScroll(); return; }
+    }
+    await waitForImagesPending(LOAD_WAIT_MAX);
+    forceLazyAttrs(); // за время скролла могли появиться новые img с data-src
+    // вернуть камеру ровно туда, где стоял пользователь
+    window.scrollTo(0, savedY);
+    await sleep(120);
+  }
+
+  // ---------------- горячие клавиши (v1.8.0) ----------------
+
+  // копия protocol.js formatCombo: ES-импорт в content script недоступен.
+  // С v1.8.1 одиночные клавиши (R, F3, Space…) тоже срабатывают; чтобы голая
+  // буква не мешала печатать, нажатия в полях ввода страницы пропускаются.
+  function comboFromEvent(e) {
+    const mods = [e.ctrlKey && 'Ctrl', e.altKey && 'Alt', e.shiftKey && 'Shift', e.metaKey && 'Meta'].filter(Boolean);
+    let key = '';
+    const c = String(e.code || '');
+    if (c.startsWith('Key')) key = c.slice(3);
+    else if (c.startsWith('Digit')) key = c.slice(5);
+    else if (c === 'Space') key = 'Space';
+    else if (/^Arrow|^Numpad\d|^F\d{1,2}$/.test(c)) key = c.replace('Arrow', '');
+    else if (PUNCT[c]) key = PUNCT[c];
+    else if (e.key && e.key.length === 1) key = e.key.toUpperCase();
+    if (!key) return '';
+    return [...mods, key].join('+');
+  }
+  const PUNCT = {
+    Comma: ',', Period: '.', Slash: '/', Backslash: '\\', Semicolon: ';', Quote: "'",
+    Minus: '-', Equal: '=', BracketLeft: '[', BracketRight: ']', Backquote: '`',
+  };
+
+  /** Пользователь печатает на странице: поля, редактируемые блоки, выборы.
+   *  Одиночная буква в такой момент не должна запускать перевод. */
+  function isTypingTarget(t) {
+    if (!t || !t.tagName) return false;
+    const tag = t.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    return !!t.isContentEditable;
+  }
+
+  // capture-фаза: перехватываем сочетание ДО обработчиков сайта
+  document.addEventListener('keydown', (e) => {
+    if (e.repeat) return; // удержание не должно спамить запусками
+    const hk = settings?.hotkeys;
+    if (!hk) return;
+    const combo = comboFromEvent(e);
+    if (!combo) return;
+    // без модификаторов — только вне печати (поля ввода, contenteditable)
+    if (!/^(Ctrl|Alt|Meta)\+/.test(combo) && isTypingTarget(e.target)) return;
+    for (const [action, bind] of Object.entries(hk)) {
+      if (bind && bind === combo) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (action === 'clearPage') clearAllTranslations(); // локально и мгновенно
+        else if (action === 'debugPage') send({ type: M.TRANSLATE_PAGE, debug: true });
+        else if (action === 'loadAll') send({ type: M.TRANSLATE_PAGE, preload: true });
+        else send({ type: M.TRANSLATE_PAGE });
+        break;
+      }
+    }
+  }, true);
+
   /** «Стереть перевод»: убрать все оверлеи (вместе со спиннерами и ошибками),
    *  кэш и состояние; отменить in-flight рендеры. Автоперевод может снова
    *  нарисовать — это штатно. */
   function clearAllTranslations() {
     renderGen++;
     resultCache.clear();
+    cleanBlobs.clear();
     if (pill) { pill.remove(); pill = null; }
     for (const el of knownTargets()) {
       const st = state.get(el);
@@ -804,6 +1267,8 @@
     injectStyles();
     if (!settings?.enabled) {
       observer?.disconnect();
+      winObserver?.disconnect();
+      winObserver = null;
       for (const el of knownTargets()) {
         const st = state.get(el);
         if (st?.overlay) { st.overlay.remove(); st.overlay = null; st.status = undefined; }
@@ -839,7 +1304,13 @@
       if (st?.status !== 'done' || !st.overlay?.isConnected) continue;
       const src = el instanceof HTMLImageElement ? (el.currentSrc || el.src) : el.__mtlBgUrl;
       const cached = src && resultCache.get(src);
-      if (cached?.items?.length) renderResults(el, cached.items, cached.natW, cached.natH);
+      if (!cached?.items?.length) continue;
+      if (settings?.renderMode !== 'badge' && !st.cleanImageData) {
+        st.overlay = null; // пиксели в блобе — перерисовка через mountOverlay
+        mountOverlay(el);
+      } else {
+        renderResults(el, cached.items, cached.natW, cached.natH);
+      }
     }
   }
 
